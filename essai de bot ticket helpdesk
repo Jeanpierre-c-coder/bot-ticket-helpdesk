@@ -1,0 +1,94 @@
+from flask import Flask, request, jsonify, render_template
+from datetime import datetime
+import json
+import os
+
+app = Flask(__name__)
+
+TICKETS_FILE = 'tickets.json'
+
+def init_ticket_file():
+    if not os.path.exists(TICKETS_FILE):
+        with open(TICKETS_FILE, 'w') as f:
+            json.dump([], f)
+
+def load_tickets():
+    try:
+        with open(TICKETS_FILE, 'r') as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+def save_tickets(tickets):
+    try:
+        with open(TICKETS_FILE, 'w') as f:
+            json.dump(tickets, f, indent=2)
+    except Exception as e:
+        print(f"Error saving tickets: {e}")
+
+def get_next_ticket_id(tickets):
+    if tickets:
+        return max(t['id'] for t in tickets) + 1
+    return 1
+
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+@app.route('/api/tickets', methods=['GET', 'POST'])
+def handle_tickets():
+    if request.method == 'POST':
+        data = request.get_json()
+        if not data or 'subject' not in data or 'description' not in data:
+            return jsonify({'error': 'Missing subject or description'}), 400
+
+        tickets = load_tickets()
+        new_ticket = {
+            'id': get_next_ticket_id(tickets),
+            'subject': data['subject'],
+            'description': data['description'],
+            'status': 'open',
+            'created_at': datetime.utcnow().isoformat(),
+            'updated_at': datetime.utcnow().isoformat(),
+            'created_by': data.get('email', 'anonymous@example.com'),
+            'assigned_to': None,
+            'comments': []
+        }
+        tickets.append(new_ticket)
+        save_tickets(tickets)
+        return jsonify(new_ticket), 201
+
+    tickets = load_tickets()
+    return jsonify(tickets)
+
+@app.route('/api/tickets/<int:ticket_id>', methods=['GET', 'PUT'])
+def handle_ticket(ticket_id):
+    tickets = load_tickets()
+    ticket = next((t for t in tickets if t['id'] == ticket_id), None)
+    if not ticket:
+        return jsonify({'error': 'Ticket not found'}), 404
+
+    if request.method == 'PUT':
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': 'No data provided'}), 400
+
+        allowed_fields = ['status', 'assigned_to', 'comment']
+        for key in allowed_fields:
+            if key in data:
+                if key == 'comment':
+                    ticket.setdefault('comments', []).append({
+                        'text': data['comment'],
+                        'posted_at': datetime.utcnow().isoformat(),
+                        'posted_by': data.get('posted_by', 'agent@helpdesk.com')
+                    })
+                else:
+                    ticket[key] = data[key]
+        ticket['updated_at'] = datetime.utcnow().isoformat()
+        save_tickets(tickets)
+
+    return jsonify(ticket)
+
+if __name__ == '__main__':
+    init_ticket_file()
+    app.run(debug=True)
