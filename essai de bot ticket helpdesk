@@ -1,94 +1,1399 @@
-from flask import Flask, request, jsonify, render_template
-from datetime import datetime
-import json
+# Si le ticket est fermé, calculer le temps de résolution
+                if data['status'] == 'closed' and old_status != 'closed':
+                    delta = datetime.utcnow() - ticket.created_at
+                    ticket.resolution_time = int(delta.total_seconds() / 30)  # En minutes
+                    
+                    # Notifier l'utilisateur que son ticket est résolu
+                    if ticket.creator.email_notifications:
+                        send_email_notification(
+                            subject=f"Votre ticket a été résolu: {ticket.subject}",
+                            recipients=[ticket.creator.email],
+                            template='email/ticket_closed.html',
+                            ticket=ticket,
+                            resolver=user
+                        )
+                        
+                        # Demander une évaluation de satisfaction
+                        send_email_notification(
+                            subject=f"Évaluez notre service - Ticket: {ticket.subject}",
+                            recipients=[ticket.creator.email],
+                            template='email/satisfaction_survey.html',
+                            ticket=ticket
+                        )
+        
+        # Assignation (seuls les agents/admins peuvent assigner)
+        if 'assigned_to' in data and user.role in ['admin', 'agent']:
+            old_assigned = ticket.assigned_to
+            assigned_user = User.query.get(data['assigned_to'])
+            if not assigned_user:
+                return jsonify({'error': 'User not found'}), 404
+            
+            ticket.assigned_to = assigned_user.id
+            
+            # Notifier l'agent assigné
+            if assigned_user.email_notifications and old_assigned != assigned_user.id:
+                send_email_notification(
+                    subject=f"Vous avez été assigné au ticket: {ticket.subject}",
+                    recipients=[assigned_user.email],
+                    template='email/ticket_assigned.html',
+                    ticket=ticket,
+                    assigner=user
+                )
+        
+        # Ajout de commentaire
+        if 'comment' in data:
+            new_comment = Comment(
+                text=data['comment'],
+                ticket_id=ticket.id,
+                user_id=user.id,
+                internal=data.get('internal', False)
+            )
+            db.session.add(new_comment)
+            db.session.flush()  # Pour obtenir l'ID du commentaire
+            
+            # Traiter les pièces jointes pour le commentaire
+            if files and 'attachments' in files:
+                attachments = files.getlist('attachments')
+                for file in attachments:
+                    if file and allowed_file(file.filename):
+                        filename = secure_filename(file.filename)
+                        # Utiliser un hash pour éviter les collisions de noms
+                        file_hash = hashlib.md5(os.urandom(32)).hexdigest()
+                        filename = f"{file_hash}_{filename}"
+                        file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+                        file.save(file_path)
+                        
+                        attachment = Attachment(
+                            filename=filename,
+                            file_path=file_path,
+                            file_size=os.path.getsize(file_path),
+                            mime_type=file.content_type,
+                            ticket_id=ticket.id,
+                            comment_id=new_comment.id,
+                            uploaded_by=session['user_id']
+                        )
+                        db.session.add(attachment)
+            
+            # Notifier les personnes concernées du nouveau commentaire
+            notify_users = set()
+            # Notifier le créateur du ticket si c'est un commentaire d'agent
+            if user.role in ['admin', 'agent'] and ticket.created_by != user.id and not new_comment.internal:
+                creator = User.query.get(ticket.created_by)
+                if creator and creator.email_notifications:
+                    notify_users.add(creator)
+            
+            # Notifier l'agent assigné si c'est un commentaire de l'utilisateur
+            if user.role == 'user' and ticket.assigned_to and ticket.assigned_to != user.id:
+                assignee = User.query.get(ticket.assigned_to)
+                if assignee and assignee.email_notifications:
+                    notify_users.add(assignee)
+            
+            # Envoyer les notifications
+            for notify_user in notify_users:
+                send_email_notification(
+                    subject=f"Nouveau commentaire sur le ticket: {ticket.subject}",
+                    recipients=[notify_user.email],
+                    template='email/new_comment.html',
+                    ticket=ticket,
+                    comment=new_comment,
+                    commenter=user
+                )
+            
+            # Notifier via WebSocket
+            socketio.emit('new_comment', {
+                'ticket_id': ticket.id,
+                'comment_id': new_comment.id,
+                'user': user.username,
+                'text': new_comment.text[:100] + '...' if len(new_comment.text) > 100 else new_comment.text,
+                'created_at': new_comment.created_at.isoformat()
+            })
+        
+        # Mise à jour de la satisfaction client
+        if 'satisfaction_score' in data and 1 <= int(data['satisfaction_score']) <= 5:
+            ticket.satisfaction_score = int(data['satisfaction_score'])
+        
+        # Mise à jour dans la base de données
+        ticket.updated_at = datetime.utcnow()
+        db.session.commit()
+        
+        # Mettre à jour l'index Elasticsearch
+        ticket.index_in_es()
+        
+        # Notifier via WebSocket si le statut a changé
+        if status_changed:
+            socketio.emit('ticket_status_changed', {
+                'ticket_id': ticket.id,
+                'old_status': old_status,
+                'new_status': ticket.status,
+                'updated_by': user.username
+            })
+        
+        return jsonify({'message': 'Ticket updated successfully'})
+    
+    elif request.method == 'DELETE':
+        # Seuls les admins peuvent supprimer des tickets
+        if user.role != 'admin':
+            return jsonify({'error': 'Insufficient permissions'}), 403
+        
+        # Supprimer de l'index Elasticsearch
+        ticket.delete_from_es()
+        
+        # Supprimer les fichiers attachés
+        for attachment in ticket.attachments:
+            try:
+                if os.path.exists(attachment.file_path):
+                    os.remove(attachment.file_path)
+            except Exception as e:
+                logger.error(f"Erreur lors de la suppression du fichier {attachment.file_path}: {str(e)}")
+        
+        db.session.delete(ticket)
+        db.session.commit()
+        
+        return jsonify({'message': 'Ticket deleted successfully'})
+
+@app.route('/api/tickets/<ticket_id>/attachments', methods=['POST'])
+@login_required
+def add_ticket_attachment(ticket_id):
+    ticket = Ticket.query.get_or_404(ticket_id)
+    user = User.query.get(session['user_id'])
+    
+    # Vérifier les permissions
+    if user.role not in ['admin', 'agent'] and ticket.created_by != user.id:
+        return jsonify({'error': 'Access denied'}), 403
+    
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file part'}), 400
+    
+    file = request.files['file']
+    
+    if file.filename == '':
+        return jsonify({'error': 'No selected file'}), 400
+    
+    if file and allowed_file(file.filename):
+        filename = secure_filename(file.filename)
+        file_hash = hashlib.md5(os.urandom(32)).hexdigest()
+        filename = f"{file_hash}_{filename}"
+        file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        file.save(file_path)
+        
+        attachment = Attachment(
+            filename=filename,
+            file_path=file_path,
+            file_size=os.path.getsize(file_path),
+            mime_type=file.content_type,
+            ticket_id=ticket.id,
+            uploaded_by=session['user_id']
+        )
+        db.session.add(attachment)
+        db.session.commit()
+        
+        # Notifier via WebSocket
+        socketio.emit('new_attachment', {
+            'ticket_id': ticket.id,
+            'attachment_id': attachment.id,
+            'filename': attachment.filename,
+            'uploaded_by': user.username
+        })
+        
+        return jsonify({
+            'message': 'File uploaded successfully',
+            'attachment': {
+                'id': attachment.id,
+                'filename': attachment.filename,
+                'file_size': attachment.file_size,
+                'mime_type': attachment.mime_type,
+                'uploaded_by': user.username,
+                'uploaded_at': attachment.uploaded_at.isoformat()
+            }
+        })
+    
+    return jsonify({'error': 'File type not allowed'}), 400
+
+@app.route('/api/attachments/<int:attachment_id>', methods=['GET', 'DELETE'])
+@login_required
+def handle_attachment(attachment_id):
+    attachment = Attachment.query.get_or_404(attachment_id)
+    user = User.query.get(session['user_id'])
+    
+    # Vérifier les permissions
+    ticket = Ticket.query.get(attachment.ticket_id)
+    if user.role not in ['admin', 'agent'] and ticket.created_by != user.id:
+        return jsonify({'error': 'Access denied'}), 403
+    
+    if request.method == 'GET':
+        # Vérifier que le fichier existe
+        if not os.path.exists(attachment.file_path):
+            return jsonify({'error': 'File not found'}), 404
+        
+        return send_from_directory(
+            os.path.dirname(attachment.file_path),
+            os.path.basename(attachment.file_path),
+            as_attachment=True,
+            download_name=attachment.filename
+        )
+    
+    elif request.method == 'DELETE':
+        # Seuls les admins, les agents ou l'uploadeur peuvent supprimer
+        if user.role not in ['admin', 'agent'] and attachment.uploaded_by != user.id:
+            return jsonify({'error': 'Insufficient permissions'}), 403
+        
+        # Supprimer le fichier
+        try:
+            if os.path.exists(attachment.file_path):
+                os.remove(attachment.file_path)
+        except Exception as e:
+            logger.error(f"Erreur lors de la suppression du fichier {attachment.file_path}: {str(e)}")
+        
+        db.session.delete(attachment)
+        db.session.commit()
+        
+        return jsonify({'message': 'Attachment deleted successfully'})
+
+# Acces  pour la recherche
+
+@app.route('/api/search', methods=['GET'])
+@login_required
+def search():
+    query = request.args.get('q', '')
+    doc_type = request.args.get('type', 'tickets')  # tickets, knowledge
+    
+    if not query:
+        return jsonify({'error': 'Query parameter required'}), 400
+    
+    if not es:
+        # Fallback à la recherche de base si Elasticsearch n'est pas disponible
+        results = []
+        
+        if doc_type == 'tickets':
+            tickets = Ticket.query.filter(
+                (Ticket.subject.ilike(f'%{query}%')) | 
+                (Ticket.description.ilike(f'%{query}%'))
+            ).limit(20).all()
+            
+            user = User.query.get(session['user_id'])
+            for ticket in tickets:
+                # Vérifier les permissions
+                if user.role in ['admin', 'agent'] or ticket.created_by == user.id:
+                    results.append({
+                        'id': ticket.id,
+                        'type': 'ticket',
+                        'subject': ticket.subject,
+                        'description': ticket.description[:150] + '...' if len(ticket.description) > 150 else ticket.description,
+                        'status': ticket.status,
+                        'created_at': ticket.created_at.isoformat()
+                    })
+        
+        elif doc_type == 'knowledge':
+            articles = KnowledgeArticle.query.filter(
+                (KnowledgeArticle.title.ilike(f'%{query}%')) | 
+                (KnowledgeArticle.content.ilike(f'%{query}%')) |
+                (KnowledgeArticle.tags.ilike(f'%{query}%'))
+            ).limit(20).all()
+            
+            for article in articles:
+                results.append({
+                    'id': article.id,
+                    'type': 'knowledge',
+                    'title': article.title,
+                    'content': article.content[:150] + '...' if len(article.content) > 150 else article.content,
+                    'tags': article.tags,
+                    'created_at': article.created_at.isoformat()
+                })
+    else:
+        # Recherche avec Elasticsearch
+        try:
+            if doc_type == 'tickets':
+                es_query = {
+                    'query': {
+                        'multi_match': {
+                            'query': query,
+                            'fields': ['subject^2', 'description', 'status', 'priority', 'category', 'created_by'],
+                            'fuzziness': 'AUTO'
+                        }
+                    },
+                    'size': 20
+                }
+                
+                response = es.search(index='tickets', body=es_query)
+                
+                results = []
+                user = User.query.get(session['user_id'])
+                
+                for hit in response['hits']['hits']:
+                    ticket = Ticket.query.get(hit['_id'])
+                    # Vérifier les permissions
+                    if ticket and (user.role in ['admin', 'agent'] or ticket.created_by == user.id):
+                        results.append({
+                            'id': ticket.id,
+                            'type': 'ticket',
+                            'subject': ticket.subject,
+                            'description': ticket.description[:150] + '...' if len(ticket.description) > 150 else ticket.description,
+                            'status': ticket.status,
+                            'score': hit['_score'],
+                            'created_at': ticket.created_at.isoformat()
+                        })
+            
+            elif doc_type == 'knowledge':
+                es_query = {
+                    'query': {
+                        'multi_match': {
+                            'query': query,
+                            'fields': ['title^3', 'content', 'category', 'tags^2'],
+                            'fuzziness': 'AUTO'
+                        }
+                    },
+                    'size': 20
+                }
+                
+                response = es.search(index='knowledge', body=es_query)
+                
+                results = []
+                for hit in response['hits']['hits']:
+                    article = KnowledgeArticle.query.get(hit['_id'])
+                    if article and article.published:
+                        results.append({
+                            'id': article.id,
+                            'type': 'knowledge',
+                            'title': article.title,
+                            'content': article.content[:150] + '...' if len(article.content) > 150 else article.content,
+                            'tags': article.tags,
+                            'score': hit['_score'],
+                            'created_at': article.created_at.isoformat()
+                        })
+        
+        except Exception as e:
+            logger.error(f"Erreur lors de la recherche Elasticsearch: {str(e)}")
+            return jsonify({'error': 'Search engine error'}), 500
+    
+    return jsonify({
+        'query': query,
+        'type': doc_type,
+        'results': results,
+        'count': len(results)
+    })
+
+# chemin pour la connaissance des données
+
+@app.route('/api/kb', methods=['GET', 'POST'])
+@login_required
+def handle_knowledge():
+    if request.method == 'GET':
+        # Filtrage
+        category = request.args.get('category')
+        tag = request.args.get('tag')
+        search = request.args.get('search')
+        
+        # Pagination
+        page = int(request.args.get('page', 1))
+        per_page = int(request.args.get('per_page', 10))
+        
+        # Base de la requête
+        query = KnowledgeArticle.query
+        
+        # Filtres
+        if category:
+            query = query.filter_by(category=category)
+        if tag:
+            query = query.filter(KnowledgeArticle.tags.like(f'%{tag}%'))
+        if search:
+            query = query.filter(KnowledgeArticle.title.like(f'%{search}%') | KnowledgeArticle.content.like(f'%{search}%'))
+        
+        # Limiter aux articles publiés pour les utilisateurs non-admin
+        user = User.query.get(session['user_id'])
+        if user.role not in ['admin', 'agent']:
+            query = query.filter_by(published=True)
+        
+        # Tri
+        query = query.order_by(KnowledgeArticle.created_at.desc())
+        
+        # Exécuter la pagination
+        paginated_articles = query.paginate(page=page, per_page=per_page, error_out=False)
+        
+        articles_data = []
+        for article in paginated_articles.items:
+            articles_data.append({
+                'id': article.id,
+                'title': article.title,
+                'content': article.content[:200] + '...' if len(article.content) > 200 else article.content,
+                'category': article.category,
+                'tags': article.tags,
+                'author': article.author.username,
+                'created_at': article.created_at.isoformat(),
+                'updated_at': article.updated_at.isoformat(),
+                'published': article.published,
+                'view_count': article.view_count
+            })
+        
+        return jsonify({
+            'articles': articles_data,
+            'page': page,
+            'per_page': per_page,
+            'total': paginated_articles.total,
+            'pages': paginated_articles.pages
+        })
+    
+    elif request.method == 'POST':
+        # Seuls les agents et admins peuvent créer des articles
+        user = User.query.get(session['user_id'])
+        if user.role not in ['admin', 'agent']:
+            return jsonify({'error': 'Insufficient permissions'}), 403
+        
+        data = request.json
+        if not data or not data.get('title') or not data.get('content'):
+            return jsonify({'error': 'Missing required fields'}), 400
+        
+        new_article = KnowledgeArticle(
+            title=data['title'],
+            content=data['content'],
+            category=data.get('category'),
+            tags=data.get('tags'),
+            author_id=user.id,
+            published=data.get('published', True)
+        )
+        
+        db.session.add(new_article)
+        db.session.commit()
+        
+        # Indexer dans Elasticsearch
+        new_article.index_in_es()
+        
+        return jsonify({
+            'message': 'Knowledge article created successfully',
+            'article': {
+                'id': new_article.id,
+                'title': new_article.title,
+                'created_at': new_article.created_at.isoformat()
+            }
+        }), 201
+
+@app.route('/api/kb/<int:article_id>', methods=['GET', 'PUT', 'DELETE'])
+@login_required
+def handle_knowledge_article(article_id):
+    article = KnowledgeArticle.query.get_or_404(article_id)
+    user = User.query.get(session['user_id'])
+    
+    # Vérifier que l'article est publié ou que l'utilisateur est admin/agent
+    if not article.published and user.role not in ['admin', 'agent']:
+        return jsonify({'error': 'Article not found'}), 404
+    
+    if request.method == 'GET':
+        # Incrémenter le compteur de vues
+        article.view_count += 1
+        db.session.commit()
+        
+        return jsonify({
+            'article': {
+                'id': article.id,
+                'title': article.title,
+                'content': article.content,
+                'category': article.category,
+                'tags': article.tags,
+                'author': article.author.username,
+                'created_at': article.created_at.isoformat(),
+                'updated_at': article.updated_at.isoformat(),
+                'published': article.published,
+                'view_count': article.view_count,
+                'helpful_count': article.helpful_count,
+                'unhelpful_count': article.unhelpful_count
+            }
+        })
+    
+    elif request.method == 'PUT':
+        # Seuls les agents, les admins ou l'auteur peuvent modifier
+        if user.role not in ['admin', 'agent'] and article.author_id != user.id:
+            return jsonify({'error': 'Insufficient permissions'}), 403
+        
+        data = request.json
+        
+        if 'title' in data:
+            article.title = data['title']
+        if 'content' in data:
+            article.content = data['content']
+        if 'category' in data:
+            article.category = data['category']
+        if 'tags' in data:
+            article.tags = data['tags']
+        if 'published' in data and (user.role in ['admin', 'agent']):
+            article.published = data['published']
+        
+        article.updated_at = datetime.utcnow()
+        db.session.commit()
+        
+        # Mettre à jour l'index Elasticsearch
+        article.index_in_es()
+        
+        return jsonify({'message': 'Knowledge article updated successfully'})
+    
+    elif request.method == 'DELETE':
+        # Seuls les admins ou l'auteur peuvent supprimer
+        if user.role != 'admin' and article.author_id != user.id:
+            return jsonify({'error': 'Insufficient permissions'}), 403
+        
+        # Supprimer de l'index Elasticsearch
+        article.delete_from_es()
+        
+        db.session.delete(article)
+        db.session.commit()
+        
+        return jsonify({'message': 'Knowledge article deleted successfully'})
+
+@app.route('/api/kb/<int:article_id>/feedback', methods=['POST'])
+@login_required
+def rate_knowledge_article(article_id):
+    article = KnowledgeArticle.query.get_or_404(article_id)
+    
+    data = request.json
+    if not data or 'helpful' not in data:
+        return jsonify({'error': 'Missing feedback data'}), 400
+    
+    if data['helpful']:
+        article.helpful_count += 1
+    else:
+        article.unhelpful_count += 1
+    
+    db.session.commit()
+    
+    return jsonify({
+        'message': 'Feedback recorded',
+        'helpful_count': article.helpful_count,
+        'unhelpful_count': article.unhelpful_count
+    })
+
+# Route pour LES SLA
+
+@app.route('/api/sla', methods=['GET', 'POST'])
+@role_required('admin')
+def handle_sla():
+    if request.method == 'GET':
+        slas = SLA.query.all()
+        slas_data = [{
+            'id': sla.id,
+            'name': sla.name,
+            'description': sla.description,
+            'priority': sla.priority,
+            'response_time': sla.response_time,
+            'resolution_time': sla.resolution_time,
+            'business_hours_only': sla.business_hours_only,
+            'created_at': sla.created_at.isoformat()
+        } for sla in slas]
+        
+        return jsonify({'slas': slas_data})
+    
+    elif request.method == 'POST':
+        data = request.json
+        if not data or not data.get('name') or not data.get('priority'):
+            return jsonify({'error': 'Missing required fields'}), 400
+        
+        new_sla = SLA(
+            name=data['name'],
+            description=data.get('description'),
+            priority=data['priority'],
+            response_time=data.get('response_time'),
+            resolution_time=data.get('resolution_time'),
+            business_hours_only=data.get('business_hours_only', True)
+        )
+        
+        db.session.add(new_sla)
+        db.session.commit()
+        
+        return jsonify({
+            'message': 'SLA created successfully',
+            'sla': {
+                'id': new_sla.id,
+                'name': new_sla.name,
+                'priority': new_sla.priority
+            }
+        }), 201
+
+@app.route('/api/sla/<int:sla_id>', methods=['GET', 'PUT', 'DELETE'])
+@role_required('admin')
+def handle_sla_detail(sla_id):
+    sla = SLA.query.get_or_404(sla_id)
+    
+    if request.method == 'GET':
+        return jsonify({
+            'sla': {
+                'id': sla.id,
+                'name': sla.name,
+                'description': sla.description,
+                'priority': sla.priority,
+                'response_time': sla.response_time,
+                'resolution_time': sla.resolution_time,
+                'business_hours_only': sla.business_hours_only,
+                'created_at': sla.created_at.isoformat(),
+                'updated_at': sla.updated_at.isoformat()
+            }
+        })
+    
+    elif request.method == 'PUT':
+        data = request.json
+        
+        if 'name' in data:
+            sla.name = data['name']
+        if 'description' in data:
+            sla.description = data['description']
+        if 'priority' in data:
+            sla.priority = data['priority']
+        if 'response_time' in data:
+            sla.response_time = data['response_time']
+        if 'resolution_time' in data:
+            sla.resolution_time = data['resolution_time']
+        if 'business_hours_only' in data:
+            sla.business_hours_only = data['business_hours_only']
+        
+        sla.updated_at = datetime.utcnow()
+        db.session.commit()
+        
+        return jsonify({'message': 'SLA updated successfully'})
+    
+    elif request.method == 'DELETE':
+        db.session.delete(sla)
+        db.session.commit()
+        
+        return jsonify({'message': 'SLA deleted successfully'})
+
+# Route des Rapport
+
+@app.route('/api/reports/tickets', methods=['GET'])
+@role_required('agent')
+def ticket_reports():
+    report_type = request.args.get('type', 'status')
+    start_date = request.args.get('start_date')
+    end_date = request.args.get('end_date')
+    
+    # Convertir les dates si fournies
+    if start_date:
+        start_date = datetime.strptime(start_date, '%Y-%m-%d')
+    else:
+        start_date = datetime.utcnow() - timedelta(days=30)
+    
+    if end_date:
+        end_date = datetime.strptime(end_date, '%Y-%m-%d')
+    else:
+        end_date = datetime.utcnow()
+    
+    query = Ticket.query.filter(Ticket.created_at.between(start_date, end_date))
+    
+    if report_type == 'status':
+        # Tickets par statut
+        tickets_by_status = {}
+        for status in ['open', 'in_progress', 'closed', 'reopened']:
+            count = query.filter_by(status=status).count()
+            tickets_by_status[status] = count
+        
+        return jsonify({'tickets_by_status': tickets_by_status})
+    
+    elif report_type == 'priority':
+        # Tickets par priorité
+        tickets_by_priority = {}
+        for priority in ['low', 'medium', 'high', 'critical']:
+            count = query.filter_by(priority=priority).count()
+            tickets_by_priority[priority] = count
+        
+        return jsonify({'tickets_by_priority': tickets_by_priority})
+    
+    elif report_type == 'category':
+        # Tickets par catégorie
+        tickets_by_category = db.session.query(
+            Ticket.category, func.count(Ticket.id)
+        ).filter(
+            Ticket.created_at.between(start_date, end_date)
+        ).group_by(Ticket.category).all()
+        
+        result = {category: count for category, count in tickets_by_category if category}
+        return jsonify({'tickets_by_category': result})
+    
+    elif report_type == 'time':
+        # Temps moyen de résolution
+        resolution_times = db.session.query(
+            Ticket.priority, func.avg(Ticket.resolution_time)
+        ).filter(
+            Ticket.status == 'closed',
+            Ticket.created_at.between(start_date, end_date),
+            Ticket.resolution_time.isnot(None)
+        ).group_by(Ticket.priority).all()
+        
+        result = {priority: round(avg, 2) for priority, avg in resolution_times if priority}
+        return jsonify({'avg_resolution_time_by_priority': result})
+    
+    elif report_type == 'agent':
+        # Performance des agents
+        agent_performance = db.session.query(from flask import Flask, request, jsonify, render_template, session, redirect, url_for, send_from_directory
+
+from flask_sqlalchemy import SQLAlchemy
+from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.utils import secure_filename
+from datetime import datetime, timedelta
+from flask_mail import Mail, Message
+from flask_socketio import SocketIO, emit
+from sqlalchemy.sql import func
+from flask_cors import CORS
+from elasticsearch import Elasticsearch
+import uuid
 import os
+import json
+import requests
+import threading
+import time
+import logging
+import hashlib
+import shutil
+import pandas as pd
+import zipfile
+from functools import wraps
 
+# Configuration de l'application
 app = Flask(__name__)
+app.config.update(
+    SECRET_KEY=os.environ.get('SECRET_KEY', os.urandom(24)),
+    SQLALCHEMY_DATABASE_URI=os.environ.get('DATABASE_URL', 'sqlite:///helpdesk.db'),
+    SQLALCHEMY_TRACK_MODIFICATIONS=False,
+    UPLOAD_FOLDER=os.path.join(os.getcwd(), 'uploads'),
+    MAX_CONTENT_LENGTH=16 * 1024 * 1024,  # 16MB max upload
+    ALLOWED_EXTENSIONS=set(['txt', 'pdf', 'png', 'jpg', 'jpeg', 'gif', 'doc', 'docx', 'xls', 'xlsx']),
+    
+    # Configuration Email
+    MAIL_SERVER=os.environ.get('MAIL_SERVER', 'smtp.gmail.com'),
+    MAIL_PORT=int(os.environ.get('MAIL_PORT', 587)),
+    MAIL_USE_TLS=os.environ.get('MAIL_USE_TLS', 'True').lower() in ('true', 'yes', '1'),
+    MAIL_USERNAME=os.environ.get('MAIL_USERNAME', 'votre_email@gmail.com'),
+    MAIL_PASSWORD=os.environ.get('MAIL_PASSWORD', 'votre_mot_de_passe'),
+    MAIL_DEFAULT_SENDER=os.environ.get('MAIL_DEFAULT_SENDER', 'helpdesk@example.com'),
+    
+    # Configuration Elasticsearch
+    ELASTICSEARCH_URL=os.environ.get('ELASTICSEARCH_URL', 'http://localhost:9200')
+)
 
-TICKETS_FILE = 'tickets.json'
+# Création des dossiers nécessaires
+if not os.path.exists(app.config['UPLOAD_FOLDER']):
+    os.makedirs(app.config['UPLOAD_FOLDER'])
 
-def init_ticket_file():
-    if not os.path.exists(TICKETS_FILE):
-        with open(TICKETS_FILE, 'w') as f:
-            json.dump([], f)
+# Initialisations
+db = SQLAlchemy(app)
+mail = Mail(app)
+socketio = SocketIO(app, cors_allowed_origins="*")
+CORS(app)
 
-def load_tickets():
+# Connexion à Elasticsearch si disponible
+try:
+    es = Elasticsearch([app.config['ELASTICSEARCH_URL']])
+except:
+    es = None
+    app.logger.warning("Elasticsearch non disponible - La recherche avancée ne fonctionnera pas")
+
+# Configuration du logging
+logging.basicConfig(level=logging.INFO, 
+                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+                    filename='helpdesk.log')
+logger = logging.getLogger(__name__)
+
+# Modele de données
+
+class User(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(80), unique=True, nullable=False)
+    email = db.Column(db.String(120), unique=True, nullable=False)
+    password = db.Column(db.String(200), nullable=False)
+    role = db.Column(db.String(20), default='user')  # 'user', 'agent', 'admin'
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    last_login = db.Column(db.DateTime)
+    email_notifications = db.Column(db.Boolean, default=True)
+    api_key = db.Column(db.String(64), unique=True)
+    external_id = db.Column(db.String(64))  # Pour l'intégration SSO
+
+    # Pour l'intégration SSO
+    def generate_api_key(self):
+        self.api_key = str(uuid.uuid4()) + str(uuid.uuid4())
+        return self.api_key
+
+class Ticket(db.Model):
+    id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    subject = db.Column(db.String(200), nullable=False)
+    description = db.Column(db.Text, nullable=False)
+    status = db.Column(db.String(20), default='open')  # 'open', 'in_progress', 'closed', 'reopened'
+    priority = db.Column(db.String(20), default='medium')  # 'low', 'medium', 'high', 'critical'
+    category = db.Column(db.String(50))
+    created_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    assigned_to = db.Column(db.Integer, db.ForeignKey('user.id'))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    due_date = db.Column(db.DateTime)  # Pour SLA
+    resolution_time = db.Column(db.Integer)  # Temps de résolution en minutes
+    sla_breach = db.Column(db.Boolean, default=False)
+    satisfaction_score = db.Column(db.Integer)  # Note de satisfaction (1-5)
+    
+    creator = db.relationship('User', foreign_keys=[created_by])
+    assignee = db.relationship('User', foreign_keys=[assigned_to])
+    comments = db.relationship('Comment', backref='ticket', lazy=True, cascade="all, delete-orphan")
+    attachments = db.relationship('Attachment', backref='ticket', lazy=True, cascade="all, delete-orphan")
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'subject': self.subject,
+            'description': self.description,
+            'status': self.status,
+            'priority': self.priority,
+            'category': self.category,
+            'created_by': self.creator.username,
+            'assigned_to': self.assignee.username if self.assignee else None,
+            'created_at': self.created_at.isoformat(),
+            'updated_at': self.updated_at.isoformat(),
+            'due_date': self.due_date.isoformat() if self.due_date else None,
+            'sla_breach': self.sla_breach,
+            'comment_count': len(self.comments)
+        }
+    
+    # Indexer dans Elasticsearch
+    def index_in_es(self):
+        if es:
+            es.index(index='tickets', id=self.id, body={
+                'subject': self.subject,
+                'description': self.description,
+                'status': self.status,
+                'priority': self.priority,
+                'category': self.category,
+                'created_by': self.creator.username,
+                'created_at': self.created_at.isoformat(),
+                'updated_at': self.updated_at.isoformat()
+            })
+    
+    # Supprimer de l'index Elasticsearch
+    def delete_from_es(self):
+        if es:
+            es.delete(index='tickets', id=self.id, ignore=[404])
+
+class Comment(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    text = db.Column(db.Text, nullable=False)
+    ticket_id = db.Column(db.String(36), db.ForeignKey('ticket.id'), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    internal = db.Column(db.Boolean, default=False)  # Notes internes visibles uniquement par les agents
+    
+    user = db.relationship('User')
+
+class Attachment(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    filename = db.Column(db.String(255), nullable=False)
+    file_path = db.Column(db.String(512), nullable=False)
+    file_size = db.Column(db.Integer)  # Taille en bytes
+    mime_type = db.Column(db.String(100))
+    ticket_id = db.Column(db.String(36), db.ForeignKey('ticket.id'), nullable=False)
+    comment_id = db.Column(db.Integer, db.ForeignKey('comment.id'))
+    uploaded_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    uploaded_at = db.Column(db.DateTime, default=datetime.utcnow)
+    
+    uploader = db.relationship('User')
+    comment = db.relationship('Comment', backref='attachments')
+
+class KnowledgeArticle(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    title = db.Column(db.String(255), nullable=False)
+    content = db.Column(db.Text, nullable=False)
+    category = db.Column(db.String(100))
+    tags = db.Column(db.String(255))  # Liste de tags séparés par des virgules
+    author_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    published = db.Column(db.Boolean, default=True)
+    view_count = db.Column(db.Integer, default=0)
+    helpful_count = db.Column(db.Integer, default=0)
+    unhelpful_count = db.Column(db.Integer, default=0)
+    
+    author = db.relationship('User')
+    
+    # Indexer dans Elasticsearch
+    def index_in_es(self):
+        if es:
+            es.index(index='knowledge', id=self.id, body={
+                'title': self.title,
+                'content': self.content,
+                'category': self.category,
+                'tags': self.tags,
+                'author': self.author.username,
+                'created_at': self.created_at.isoformat(),
+                'updated_at': self.updated_at.isoformat()
+            })
+    
+    # Supprimer de l'index Elasticsearch
+    def delete_from_es(self):
+        if es:
+            es.delete(index='knowledge', id=self.id, ignore=[404])
+
+class SLA(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), nullable=False)
+    description = db.Column(db.Text)
+    priority = db.Column(db.String(20), nullable=False)  # 'low', 'medium', 'high', 'critical'
+    response_time = db.Column(db.Integer)  # Temps de réponse en minutes
+    resolution_time = db.Column(db.Integer)  # Temps de résolution en minutes
+    business_hours_only = db.Column(db.Boolean, default=True)  # Considérer uniquement les heures ouvrables
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+class Notification(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    ticket_id = db.Column(db.String(36), db.ForeignKey('ticket.id'))
+    message = db.Column(db.Text, nullable=False)
+    type = db.Column(db.String(50))  # 'ticket_created', 'comment_added', 'sla_breach', etc.
+    read = db.Column(db.Boolean, default=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    
+    user = db.relationship('User')
+    ticket = db.relationship('Ticket')
+
+class Integration(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), nullable=False)
+    type = db.Column(db.String(50), nullable=False)  # 'sso', 'crm', 'chat', etc.
+    config = db.Column(db.Text)  # Configuration JSON
+    active = db.Column(db.Boolean, default=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+# Données utliisateurs
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in app.config['ALLOWED_EXTENSIONS']
+
+def send_email_notification(subject, recipients, template, **kwargs):
     try:
-        with open(TICKETS_FILE, 'r') as f:
-            return json.load(f)
-    except Exception:
-        return []
-
-def save_tickets(tickets):
-    try:
-        with open(TICKETS_FILE, 'w') as f:
-            json.dump(tickets, f, indent=2)
+        msg = Message(subject, recipients=recipients)
+        msg.html = render_template(template, **kwargs)
+        mail.send(msg)
+        logger.info(f"Email envoyé à {recipients} - Sujet: {subject}")
     except Exception as e:
-        print(f"Error saving tickets: {e}")
+        logger.error(f"Erreur lors de l'envoi d'email: {str(e)}")
 
-def get_next_ticket_id(tickets):
-    if tickets:
-        return max(t['id'] for t in tickets) + 1
-    return 1
+def calculate_due_date(priority):
+    """Calcule la date d'échéance en fonction de la priorité et des SLA"""
+    sla = SLA.query.filter_by(priority=priority).first()
+    if not sla:
+        # SLA par défaut si non défini
+        resolution_minutes = {
+            'low': 4320,        # 3 jours
+            'medium': 1440,     # 1 jour
+            'high': 240,        # 4 heures
+            'critical': 60      # 1 heure
+        }.get(priority, 1440)
+    else:
+        resolution_minutes = sla.resolution_time
+    
+    return datetime.utcnow() + timedelta(minutes=resolution_minutes)
 
-@app.route('/')
-def index():
-    return render_template('index.html')
+def check_sla_breaches():
+    """Vérifie les violations de SLA pour les tickets ouverts"""
+    open_tickets = Ticket.query.filter(Ticket.status.in_(['open', 'in_progress'])).all()
+    now = datetime.utcnow()
+    
+    for ticket in open_tickets:
+        if ticket.due_date and now > ticket.due_date and not ticket.sla_breach:
+            # Marquer comme violation de SLA
+            ticket.sla_breach = True
+            
+            # Créer une notification
+            notification = Notification(
+                user_id=ticket.assigned_to if ticket.assigned_to else ticket.created_by,
+                ticket_id=ticket.id,
+                message=f"Violation de SLA pour le ticket #{ticket.id}: {ticket.subject}",
+                type='sla_breach'
+            )
+            db.session.add(notification)
+            
+            # Notifier par email
+            if ticket.assignee and ticket.assignee.email_notifications:
+                send_email_notification(
+                    subject=f"[URGENT] Violation de SLA - Ticket #{ticket.id}",
+                    recipients=[ticket.assignee.email],
+                    template='email/sla_breach.html',
+                    ticket=ticket
+                )
+            
+            # Notifier via WebSocket
+            socketio.emit('sla_breach', {
+                'ticket_id': ticket.id,
+                'subject': ticket.subject,
+                'priority': ticket.priority
+            })
+    
+    db.session.commit()
+
+# Démarrer un thread de vérification des SLA
+def sla_checker_thread():
+    while True:
+        with app.app_context():
+            check_sla_breaches()
+        time.sleep(300)  # Vérifier toutes les 5 minutes
+
+# Decorateurs
+
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'user_id' not in session:
+            # Vérifier si une clé API est fournie
+            api_key = request.headers.get('X-API-Key')
+            if api_key:
+                user = User.query.filter_by(api_key=api_key).first()
+                if user:
+                    session['user_id'] = user.id
+                    session['user_role'] = user.role
+                    return f(*args, **kwargs)
+            return jsonify({'error': 'Authentication required'}), 401
+        return f(*args, **kwargs)
+    return decorated_function
+
+def role_required(role):
+    def decorator(f):
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            if 'user_id' not in session:
+                return jsonify({'error': 'Authentication required'}), 401
+            user = User.query.get(session['user_id'])
+            if user.role != role and user.role != 'admin':
+                return jsonify({'error': 'Insufficient permissions'}), 403
+            return f(*args, **kwargs)
+        return decorated_function
+    return decorator
+
+# Chemin d'authentification
+
+@app.route('/api/register', methods=['POST'])
+def register():
+    data = request.json
+    if not data or not data.get('username') or not data.get('email') or not data.get('password'):
+        return jsonify({'error': 'Missing required fields'}), 400
+    
+    if User.query.filter_by(username=data['username']).first():
+        return jsonify({'error': 'Username already exists'}), 400
+    
+    if User.query.filter_by(email=data['email']).first():
+        return jsonify({'error': 'Email already exists'}), 400
+    
+    hashed_password = generate_password_hash(data['password'], method='sha256')
+    
+    new_user = User(
+        username=data['username'],
+        email=data['email'],
+        password=hashed_password,
+        role=data.get('role', 'user'),
+        email_notifications=data.get('email_notifications', True)
+    )
+    
+    # Générer une clé API
+    new_user.generate_api_key()
+    
+    db.session.add(new_user)
+    db.session.commit()
+    
+    # Envoyer un email de bienvenue
+    send_email_notification(
+        subject="Bienvenue sur notre plateforme de Helpdesk",
+        recipients=[new_user.email],
+        template='email/welcome.html',
+        user=new_user
+    )
+    
+    return jsonify({
+        'message': 'User created successfully',
+        'user': {
+            'id': new_user.id,
+            'username': new_user.username,
+            'email': new_user.email,
+            'role': new_user.role,
+            'api_key': new_user.api_key
+        }
+    }), 201
+
+@app.route('/api/login', methods=['POST'])
+def login():
+    data = request.json
+    if not data or not data.get('username') or not data.get('password'):
+        return jsonify({'error': 'Missing credentials'}), 400
+    
+    user = User.query.filter_by(username=data['username']).first()
+    
+    if not user or not check_password_hash(user.password, data['password']):
+        return jsonify({'error': 'Invalid credentials'}), 401
+    
+    session['user_id'] = user.id
+    session['user_role'] = user.role
+    
+    # Mettre à jour la date de dernière connexion
+    user.last_login = datetime.utcnow()
+    db.session.commit()
+    
+    return jsonify({
+        'message': 'Logged in successfully',
+        'user': {
+            'id': user.id,
+            'username': user.username,
+            'email': user.email,
+            'role': user.role,
+            'api_key': user.api_key
+        }
+    })
+
+@app.route('/api/logout', methods=['POST'])
+@login_required
+def logout():
+    session.clear()
+    return jsonify({'message': 'Logged out successfully'})
+
+# Route pour les données en sorties
 
 @app.route('/api/tickets', methods=['GET', 'POST'])
+@login_required
 def handle_tickets():
     if request.method == 'POST':
-        data = request.get_json()
-        if not data or 'subject' not in data or 'description' not in data:
-            return jsonify({'error': 'Missing subject or description'}), 400
+        # Créer un nouveau ticket
+        if request.is_json:
+            data = request.json
+            files = None
+        else:
+            data = request.form.to_dict()
+            files = request.files
+        
+        if not data or not data.get('subject') or not data.get('description'):
+            return jsonify({'error': 'Missing required fields'}), 400
+        
+        # Créer le ticket
+        new_ticket = Ticket(
+            subject=data['subject'],
+            description=data['description'],
+            priority=data.get('priority', 'medium'),
+            category=data.get('category'),
+            created_by=session['user_id']
+        )
+        
+        # Calculer la date d'échéance SLA
+        new_ticket.due_date = calculate_due_date(new_ticket.priority)
+        
+        db.session.add(new_ticket)
+        db.session.commit()
+        
+        # Traiter les pièces jointes si présentes
+        if files and 'attachments' in files:
+            attachments = files.getlist('attachments')
+            for file in attachments:
+                if file and allowed_file(file.filename):
+                    filename = secure_filename(file.filename)
+                    file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+                    file.save(file_path)
+                    
+                    attachment = Attachment(
+                        filename=filename,
+                        file_path=file_path,
+                        file_size=os.path.getsize(file_path),
+                        mime_type=file.content_type,
+                        ticket_id=new_ticket.id,
+                        uploaded_by=session['user_id']
+                    )
+                    db.session.add(attachment)
+        
+        db.session.commit()
+        
+        # Indexer dans Elasticsearch
+        new_ticket.index_in_es()
+        
+        # Notifier les agents via WebSocket
+        socketio.emit('new_ticket', {
+            'id': new_ticket.id,
+            'subject': new_ticket.subject,
+            'priority': new_ticket.priority,
+            'category': new_ticket.category,
+            'created_by': User.query.get(new_ticket.created_by).username
+        })
+        
+        # Envoyer des emails aux agents
+        agents = User.query.filter(User.role.in_(['agent', 'admin']), User.email_notifications == True).all()
+        if agents:
+            agent_emails = [agent.email for agent in agents]
+            send_email_notification(
+                subject=f"Nouveau ticket: {new_ticket.subject}",
+                recipients=agent_emails,
+                template='email/new_ticket.html',
+                ticket=new_ticket,
+                creator=User.query.get(new_ticket.created_by)
+            )
+        
+        return jsonify({
+            'message': 'Ticket created successfully',
+            'ticket': {
+                'id': new_ticket.id,
+                'subject': new_ticket.subject,
+                'status': new_ticket.status,
+                'priority': new_ticket.priority,
+                'due_date': new_ticket.due_date.isoformat() if new_ticket.due_date else None,
+                'created_at': new_ticket.created_at.isoformat()
+            }
+        }), 201
+    
+    # GET - Lister les tickets
+    user = User.query.get(session['user_id'])
+    
+    # Filtrage
+    status = request.args.get('status')
+    priority = request.args.get('priority')
+    category = request.args.get('category')
+    search = request.args.get('search')
+    
+    # Pagination
+    page = int(request.args.get('page', 1))
+    per_page = int(request.args.get('per_page', 10))
+    
+    # Base de la requête
+    query = Ticket.query
+    
+    # Filtres
+    if status:
+        query = query.filter_by(status=status)
+    if priority:
+        query = query.filter_by(priority=priority)
+    if category:
+        query = query.filter_by(category=category)
+    
+    # Recherche simple (pour recherche avancée, voir la route /api/search)
+    if search:
+        query = query.filter(Ticket.subject.like(f'%{search}%') | Ticket.description.like(f'%{search}%'))
+    
+    # Limiter par rôle
+    if user.role not in ['admin', 'agent']:
+        query = query.filter_by(created_by=user.id)
+    
+    # Si agent assigné
+    assigned = request.args.get('assigned')
+    if assigned == 'me' and user.role in ['admin', 'agent']:
+        query = query.filter_by(assigned_to=user.id)
+    
+    # Tri
+    sort_by = request.args.get('sort_by', 'created_at')
+    sort_dir = request.args.get('sort_dir', 'desc')
+    
+    if sort_dir.lower() == 'asc':
+        query = query.order_by(getattr(Ticket, sort_by).asc())
+    else:
+        query = query.order_by(getattr(Ticket, sort_by).desc())
+    
+    # Exécuter la pagination
+    paginated_tickets = query.paginate(page=page, per_page=per_page, error_out=False)
+    
+    tickets_data = []
+    for ticket in paginated_tickets.items:
+        tickets_data.append({
+            'id': ticket.id,
+            'subject': ticket.subject,
+            'status': ticket.status,
+            'priority': ticket.priority,
+            'category': ticket.category,
+            'created_by': ticket.creator.username,
+            'assigned_to': ticket.assignee.username if ticket.assignee else None,
+            'created_at': ticket.created_at.isoformat(),
+            'updated_at': ticket.updated_at.isoformat(),
+            'due_date': ticket.due_date.isoformat() if ticket.due_date else None,
+            'sla_breach': ticket.sla_breach,
+            'comment_count': len(ticket.comments),
+            'attachment_count': len(ticket.attachments)
+        })
+    
+    return jsonify({
+        'tickets': tickets_data,
+        'page': page,
+        'per_page': per_page,
+        'total': paginated_tickets.total,
+        'pages': paginated_tickets.pages
+    })
 
-        tickets = load_tickets()
-        new_ticket = {
-            'id': get_next_ticket_id(tickets),
-            'subject': data['subject'],
-            'description': data['description'],
-            'status': 'open',
-            'created_at': datetime.utcnow().isoformat(),
-            'updated_at': datetime.utcnow().isoformat(),
-            'created_by': data.get('email', 'anonymous@example.com'),
-            'assigned_to': None,
-            'comments': []
-        }
-        tickets.append(new_ticket)
-        save_tickets(tickets)
-        return jsonify(new_ticket), 201
-
-    tickets = load_tickets()
-    return jsonify(tickets)
-
-@app.route('/api/tickets/<int:ticket_id>', methods=['GET', 'PUT'])
+@app.route('/api/tickets/<ticket_id>', methods=['GET', 'PUT', 'DELETE'])
+@login_required
 def handle_ticket(ticket_id):
-    tickets = load_tickets()
-    ticket = next((t for t in tickets if t['id'] == ticket_id), None)
-    if not ticket:
-        return jsonify({'error': 'Ticket not found'}), 404
-
-    if request.method == 'PUT':
-        data = request.get_json()
-        if not data:
-            return jsonify({'error': 'No data provided'}), 400
-
-        allowed_fields = ['status', 'assigned_to', 'comment']
-        for key in allowed_fields:
-            if key in data:
-                if key == 'comment':
-                    ticket.setdefault('comments', []).append({
-                        'text': data['comment'],
-                        'posted_at': datetime.utcnow().isoformat(),
-                        'posted_by': data.get('posted_by', 'agent@helpdesk.com')
-                    })
-                else:
-                    ticket[key] = data[key]
-        ticket['updated_at'] = datetime.utcnow().isoformat()
-        save_tickets(tickets)
-
-    return jsonify(ticket)
-
-if __name__ == '__main__':
-    init_ticket_file()
-    app.run(debug=True)
+    ticket = Ticket.query.get_or_404(ticket_id)
+    user = User.query.get(session['user_id'])
+    
+    # Vérifier les permissions
+    if user.role not in ['admin', 'agent'] and ticket.created_by != user.id:
+        return jsonify({'error': 'Access denied'}), 403
+    
+    if request.method == 'GET':
+        comments_data = [{
+            'id': comment.id,
+            'text': comment.text,
+            'user': comment.user.username,
+            'internal': comment.internal,
+            'created_at': comment.created_at.isoformat(),
+            'attachments': [{
+                'id': attachment.id,
+                'filename': attachment.filename,
+                'file_size': attachment.file_size,
+                'mime_type': attachment.mime_type,
+                'uploaded_by': attachment.uploader.username,
+                'uploaded_at': attachment.uploaded_at.isoformat()
+            } for attachment in comment.attachments]
+        } for comment in ticket.comments if not comment.internal or user.role in ['admin', 'agent']]
+        
+        attachments_data = [{
+            'id': attachment.id,
+            'filename': attachment.filename,
+            'file_size': attachment.file_size,
+            'mime_type': attachment.mime_type,
+            'uploaded_by': attachment.uploader.username,
+            'uploaded_at': attachment.uploaded_at.isoformat()
+        } for attachment in ticket.attachments if not attachment.comment_id]
+        
+        return jsonify({
+            'ticket': {
+                'id': ticket.id,
+                'subject': ticket.subject,
+                'description': ticket.description,
+                'status': ticket.status,
+                'priority': ticket.priority,
+                'category': ticket.category,
+                'created_by': ticket.creator.username,
+                'assigned_to': ticket.assignee.username if ticket.assignee else None,
+                'created_at': ticket.created_at.isoformat(),
+                'updated_at': ticket.updated_at.isoformat(),
+                'due_date': ticket.due_date.isoformat() if ticket.due_date else None,
+                'sla_breach': ticket.sla_breach,
+                'satisfaction_score': ticket.satisfaction_score,
+                'comments': comments_data,
+                'attachments': attachments_data
+            }
+        })
+    
+    elif request.method == 'PUT':
+        if request.is_json:
+            data = request.json
+            files = None
+        else:
+            data = request.form.to_dict()
+            files = request.files
+        
+        old_status = ticket.status
+        
+        # Mise à jour des champs de base
+        if 'subject' in data:
+            ticket.subject = data['subject']
+        if 'description' in data:
+            ticket.description = data['description']
+        
+        # Mise à jour de la priorité et recalcul du SLA si nécessaire
+        if 'priority' in data and ticket.priority != data['priority']:
+            ticket.priority = data['priority']
+            # Recalculer le SLA si le ticket est toujours ouvert
+            if ticket.status in ['open', 'in_progress']:
+                ticket.due_date = calculate_due_date(ticket.priority)
+        
+        if 'category' in data:
+            ticket.category = data['category']
+        
+        # Gestion du statut (seuls les agents/admins peuvent changer le statut)
+        status_changed = False
+        if 'status' in data and user.role in ['admin', 'agent']:
+            if data['status'] != ticket.status:
+                status_changed = True
+                ticket.status = data['status']
+                
+                # Si le ticket est fermé, calculer le temps de résolution
+                if data['status'] == 'closed' and old_status != 'close
