@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Helpdesk Ticket System</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            line-height: 1.6;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            max-width: 1000px;
+            margin: 0 auto;
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 0 10px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #333;
+            text-align: center;
+        }
+        .ticket-form {
+            background: #f9f9f9;
+            padding: 20px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+        }
+        .form-group {
+            margin-bottom: 15px;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+        input, textarea, select {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            box-sizing: border-box;
+        }
+        button {
+            background: #4CAF50;
+            color: white;
+            border: none;
+            padding: 10px 15px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+        }
+        button:hover {
+            background: #45a049;
+        }
+        .ticket-list {
+            margin-top: 20px;
+        }
+        .ticket {
+            background: white;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            padding: 15px;
+            margin-bottom: 10px;
+        }
+        .ticket-header {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 10px;
+        }
+        .ticket-title {
+            font-weight: bold;
+            font-size: 18px;
+        }
+        .ticket-status {
+            padding: 3px 8px;
+            border-radius: 3px;
+            font-size: 14px;
+        }
+        .status-open {
+            background: #ffeb3b;
+        }
+        .status-closed {
+            background: #8bc34a;
+            color: white;
+        }
+        .ticket-meta {
+            color: #666;
+            font-size: 14px;
+            margin-bottom: 10px;
+        }
+        .ticket-description {
+            margin-bottom: 15px;
+        }
+        .comments {
+            margin-top: 15px;
+            border-top: 1px solid #eee;
+            padding-top: 15px;
+        }
+        .comment {
+            background: #f9f9f9;
+            padding: 10px;
+            border-radius: 4px;
+            margin-bottom: 10px;
+        }
+        .comment-meta {
+            font-size: 12px;
+            color: #666;
+            margin-bottom: 5px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Helpdesk Ticket System</h1>
+        
+        <div class="ticket-form">
+            <h2>Create New Ticket</h2>
+            <div class="form-group">
+                <label for="email">Your Email</label>
+                <input type="email" id="email" required>
+            </div>
+            <div class="form-group">
+                <label for="subject">Subject</label>
+                <input type="text" id="subject" required>
+            </div>
+            <div class="form-group">
+                <label for="description">Description</label>
+                <textarea id="description" rows="5" required></textarea>
+            </div>
+            <button id="submit-ticket">Submit Ticket</button>
+        </div>
+        
+        <div class="ticket-list">
+            <h2>Your Tickets</h2>
+            <div id="tickets-container">
+                <!-- Tickets will be loaded here -->
+            </div>
+        </div>
+    </div>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            // Submit new ticket
+            document.getElementById('submit-ticket').addEventListener('click', createTicket);
+            
+            // Load existing tickets
+            loadTickets();
+        });
+
+        function createTicket() {
+            const email = document.getElementById('email').value;
+            const subject = document.getElementById('subject').value;
+            const description = document.getElementById('description').value;
+            
+            if (!email || !subject || !description) {
+                alert('Please fill all fields');
+                return;
+            }
+            
+            fetch('/api/tickets', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    subject: subject,
+                    description: description,
+                    email: email
+                })
+            })
+            .then(response => response.json())
+            .then(ticket => {
+                alert('Ticket created successfully!');
+                document.getElementById('email').value = '';
+                document.getElementById('subject').value = '';
+                document.getElementById('description').value = '';
+                loadTickets();
+            })
+            .catch(error => {
+                console.error('Error:', error);
+                alert('Error creating ticket');
+            });
+        }
+
+        function loadTickets() {
+            fetch('/api/tickets')
+                .then(response => response.json())
+                .then(tickets => {
+                    const container = document.getElementById('tickets-container');
+                    container.innerHTML = '';
+                    
+                    if (tickets.length === 0) {
+                        container.innerHTML = '<p>No tickets found.</p>';
+                        return;
+                    }
+                    
+                    tickets.forEach(ticket => {
+                        const ticketElement = document.createElement('div');
+                        ticketElement.className = 'ticket';
+                        ticketElement.innerHTML = `
+                            <div class="ticket-header">
+                                <span class="ticket-title">${ticket.subject}</span>
+                                <span class="ticket-status status-${ticket.status}">${ticket.status}</span>
+                            </div>
+                            <div class="ticket-meta">
+                                Created by ${ticket.created_by} on ${new Date(ticket.created_at).toLocaleString()}
+                            </div>
+                            <div class="ticket-description">
+                                ${ticket.description}
+                            </div>
+                            ${ticket.comments && ticket.comments.length > 0 ? `
+                            <div class="comments">
+                                <h3>Comments</h3>
+                                ${ticket.comments.map(comment => `
+                                    <div class="comment">
+                                        <div class="comment-meta">
+                                            Posted by ${comment.posted_by} on ${new Date(comment.posted_at).toLocaleString()}
+                                        </div>
+                                        <div>${comment.text}</div>
+                                    </div>
+                                `).join('')}
+                            </div>
+                            ` : ''}
+                        `;
+                        container.appendChild(ticketElement);
+                    });
+                })
+                .catch(error => {
+                    console.error('Error:', error);
+                    document.getElementById('tickets-container').innerHTML = '<p>Error loading tickets.</p>';
+                });
+        }
+    </script>
+</body>
+</html>
